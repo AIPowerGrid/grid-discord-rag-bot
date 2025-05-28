@@ -4,7 +4,7 @@ A Discord bot that can answer questions about AI Power Grid using local document
 
 ## Features
 
-- Process and index documentation about AI Power Grid
+- Process and index documentation about your project
 - Store vector embeddings locally using ChromaDB
 - Retrieve relevant context when users ask questions
 - Send retrieved context + question to AI Power Grid API
