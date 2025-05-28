@@ -1,0 +1,44 @@
+# Environment variables
+.env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Local ChromaDB data
+chroma_db/
+
+# Logs
+*.log
+
+# Test files
+test_*.py
+!test_imports.py
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Cursor specific files
+.cursor/
+
+# GitHub deployment script
+github_push.sh
+COMMIT_MSG.txt 
