@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 GRID_API_KEY = os.getenv('GRID_API_KEY')
-GRID_MODEL = os.getenv('GRID_MODEL', 'grid/llama-3.3-70b-versatile')
+GRID_MODEL = os.getenv('GRID_MODEL', 'grid/meta-llama/llama-4-maverick-17b-128e-instruct')
 
 # API endpoints from example
 TEXT_GENERATION_ENDPOINT = 'https://api.aipowergrid.io/api/v2/generate/text/async'
@@ -25,7 +25,7 @@ class GridClient:
         else:
             print(f"Using model: {GRID_MODEL}")
     
-    def get_answer(self, question: str, context: List[Dict[str, Any]]) -> str:
+    async def get_answer(self, question: str, context: List[Dict[str, Any]]) -> str:
         """Get answer from AI Power Grid API using retrieved context."""
         if not GRID_API_KEY:
             return "Error: AI Power Grid API key not configured"
@@ -35,9 +35,27 @@ class GridClient:
         for i, item in enumerate(context):
             formatted_context += f"[Document {i+1}] {item['text']}\n\n"
         
+        # Check if this is a follow-up question
+        is_followup = "previous question:" in question.lower() or "follow-up question:" in question.lower()
+        
         # Create prompt with context and question
-        prompt = f"""
-You are a helpful assistant answering questions about a Discord project.
+        if is_followup:
+            prompt = f"""
+You are a helpful assistant answering questions about AI Power Grid.
+Use only the following context and previous conversation to answer the question. 
+If you don't know the answer based on the context, say "I don't have enough information to answer this question."
+
+CONTEXT:
+{formatted_context}
+
+CONVERSATION HISTORY AND CURRENT QUESTION:
+{question}
+
+ANSWER:
+"""
+        else:
+            prompt = f"""
+You are a helpful assistant answering questions about AI Power Grid.
 Use only the following context to answer the question. If you don't know the answer based on the context, say "I don't have enough information to answer this question."
 
 CONTEXT:
@@ -109,7 +127,7 @@ ANSWER:
             print(f"Text generation request submitted with ID: {generation_id}")
             
             # Step 2: Poll for the results
-            generation_result = self._poll_for_text_results(generation_id)
+            generation_result = await self._poll_for_text_results(generation_id)
             
             # Step 3: Process and return the result
             if generation_result.get("error"):
@@ -124,7 +142,7 @@ ANSWER:
         except requests.RequestException as e:
             return f"Error calling AI Power Grid API: {str(e)}"
     
-    def _poll_for_text_results(self, generation_id, max_wait_time_seconds=120):
+    async def _poll_for_text_results(self, generation_id, max_wait_time_seconds=120):
         """Poll for text generation results."""
         try:
             print(f"Starting to poll for text generation results for ID: {generation_id}")
@@ -141,7 +159,8 @@ ANSWER:
                 
                 # Sleep between polling attempts to avoid rate limiting
                 if attempts > 1:
-                    time.sleep(poll_interval_seconds)
+                    import asyncio
+                    await asyncio.sleep(poll_interval_seconds)
                 
                 # Make the API request to check the status
                 status_response = requests.get(
