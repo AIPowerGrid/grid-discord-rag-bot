@@ -9,6 +9,10 @@ A Discord bot that can answer questions about AI Power Grid using local document
 - Retrieve relevant context when users ask questions
 - Send retrieved context + question to AI Power Grid API
 - Format and return responses in Discord
+- Maintain conversation context for follow-up questions
+- Respond to both mentions and replies to previous messages
+- Upload documents directly through Discord attachments
+- List and manage documents in the knowledge base
 
 ## Setup
 
@@ -53,17 +57,47 @@ A Discord bot that can answer questions about AI Power Grid using local document
 - `DISCORD_TOKEN`: Your Discord bot token
 - `GRID_API_KEY`: Your AI Power Grid API key
 - `GRID_MODEL`: The AI Power Grid model to use (default: grid/meta-llama/llama-4-maverick-17b-128e-instruct)
-- `DISCORD_CHANNELS`: Comma-separated list of Discord channel IDs where the bot will listen for mentions
+- `DISCORD_CHANNELS`: Comma-separated list of Discord channel IDs where the bot will listen for mentions and commands
+- `LISTENING_CHANNEL_ID`: Channel ID where the bot will actively listen and respond to messages (optional)
+- `ADMIN_USER_ID`: Discord user ID of the admin authorized to manage documents
 - `CHROMA_DB_PATH`: Path to store ChromaDB data (default: ./chroma_db)
 
 ## Usage
 
-In Discord, mention the bot in one of the configured channels with your question:
-- `@BotName What is AI Power Grid?`
-- `@BotName How does AI Power Grid handle text generation?`
-- `@BotName What security features does AI Power Grid offer?`
+### Initial Questions
+The bot can respond in two ways:
 
-If you mention the bot without a question, it will display a help message.
+**1. Active Listening (if LISTENING_CHANNEL_ID is set):**
+- In the designated listening channel, the bot will automatically classify messages and respond when it thinks it can help
+- No need to mention the bot - just ask questions naturally
+- The bot uses AI classification to determine when to respond
+
+**2. Mentions (in DISCORD_CHANNELS):**
+- Mention the bot in one of the configured channels with your question:
+  - `@BotName What is AI Power Grid?`
+  - `@BotName How does AI Power Grid handle text generation?`
+  - `@BotName What security features does AI Power Grid offer?`
+- If you mention the bot without a question, it will display a help message
+
+### Follow-up Questions
+To ask follow-up questions and continue the conversation:
+- Reply directly to the bot's previous answer with your follow-up question
+- The bot will maintain context from the previous interaction to provide more relevant answers
+
+The bot remembers up to 10 recent messages in each channel to maintain conversation context and provide more natural responses.
+
+### Document Management (Admin Only)
+Administrators (specified by ADMIN_USER_ID) can manage documents directly through Discord:
+
+- **Upload Documents**: 
+  - Use `!upload` command with attached files (.txt, .md, .mdx)
+  - Or simply attach files to a message in an allowed channel
+
+- **List Documents**: 
+  - Use `!list` command to see all available documents
+
+- **Delete Documents**: 
+  - Use `!delete [filename]` to remove a document from the knowledge base
 
 ## Troubleshooting
 

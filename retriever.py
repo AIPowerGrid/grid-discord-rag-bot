@@ -59,12 +59,12 @@ class DocumentRetriever:
         # Initialize ChromaDB client
         self.chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         
-        # Check if collection exists and create if needed
+        # Check if collection exists and has correct dimensions
         try:
             self.chroma_collection = self.chroma_client.get_collection("discord_docs")
             print("Found existing collection 'discord_docs'")
         except NotFoundError:
-            # Collection doesn't exist, create it
+            # Collection doesn't exist, create it with the correct embedding dimension
             print(f"Creating new collection 'discord_docs'")
             self.chroma_collection = self.chroma_client.create_collection(
                 name="discord_docs",
@@ -118,11 +118,11 @@ class DocumentRetriever:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
         
-        # Determine the path for the document
-        doc_path = file_path
-        
-        # If the file is not already in the docs directory, copy it there
-        if not file_path.startswith(os.path.abspath('docs')):
+        # If the file is already in the docs directory, use it directly
+        # Otherwise, copy it to docs directory
+        if os.path.dirname(os.path.abspath(file_path)) == os.path.abspath('docs'):
+            doc_path = file_path
+        else:
             doc_path = os.path.join('docs', os.path.basename(file_path))
             shutil.copy2(file_path, doc_path)
         
@@ -169,6 +169,29 @@ class DocumentRetriever:
         
         return f"Ingested document from {url}"
     
+    def ingest_content(self, content: str, filename: str) -> str:
+        """Ingest content directly into the index."""
+        # Save content to docs directory
+        doc_path = os.path.join('docs', filename)
+        
+        # Save content
+        with open(doc_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        # Create document object
+        document = Document(text=content, metadata={"source": filename})
+        
+        # Add to index
+        if self.index is None:
+            self.index = VectorStoreIndex.from_documents(
+                [document],
+                storage_context=self.storage_context
+            )
+        else:
+            self.index.insert_nodes([document])
+        
+        return f"Ingested document: {filename}"
+    
     def get_relevant_context(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Retrieve relevant context for a query."""
         if self.index is None:
@@ -189,4 +212,68 @@ class DocumentRetriever:
                 "source": node.metadata.get("source", "Unknown")
             })
         
-        return context 
+        return context
+    
+    def list_documents(self) -> List[Dict[str, Any]]:
+        """List all documents in the docs directory."""
+        if not os.path.exists('docs'):
+            return []
+        
+        documents = []
+        for filename in os.listdir('docs'):
+            if os.path.isfile(os.path.join('docs', filename)):
+                # Skip README and hidden files
+                if filename == 'README.md' or filename.startswith('.'):
+                    continue
+                    
+                file_path = os.path.join('docs', filename)
+                file_size = os.path.getsize(file_path)
+                file_time = os.path.getmtime(file_path)
+                
+                documents.append({
+                    "filename": filename,
+                    "size": file_size,
+                    "last_modified": file_time,
+                    "path": file_path
+                })
+        
+        # Sort by last modified time (newest first)
+        documents.sort(key=lambda x: x["last_modified"], reverse=True)
+        
+        return documents
+    
+    def delete_document(self, filename: str) -> str:
+        """Delete a document from the docs directory and rebuild the index."""
+        doc_path = os.path.join('docs', filename)
+        
+        # Check if file exists
+        if not os.path.exists(doc_path):
+            raise FileNotFoundError(f"Document not found: {filename}")
+        
+        # Delete the file
+        os.remove(doc_path)
+        
+        # Rebuild the index
+        # For simplicity, we'll delete the collection and rebuild from scratch
+        try:
+            self.chroma_client.delete_collection("discord_docs")
+        except Exception as e:
+            print(f"Error deleting collection: {str(e)}")
+        
+        # Create new collection
+        self.chroma_collection = self.chroma_client.create_collection(
+            name="discord_docs",
+            metadata={"hnsw:space": "cosine"}
+        )
+        
+        # Update vector store and storage context
+        self.vector_store = ChromaVectorStore(chroma_collection=self.chroma_collection)
+        self.storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
+        
+        # Rebuild index if there are still documents
+        if os.path.exists('docs') and len([f for f in os.listdir('docs') if not f.startswith('.') and f != 'README.md']) > 0:
+            self.index = self._create_index()
+        else:
+            self.index = None
+        
+        return f"Deleted document: {filename}" 
