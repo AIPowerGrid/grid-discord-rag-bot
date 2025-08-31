@@ -272,9 +272,14 @@ async def classify_and_respond(message):
         # Retrieve relevant documents for the response
         context = retriever.get_relevant_context(content)
         
-        # Single API call with JSON response
+                # Single API call with JSON response
+        current_time = datetime.datetime.now()
+        timestamp = current_time.strftime("%B %d, %Y at %I:%M %p")
+        
         single_prompt = f"""
 You are {BOT_NAME}, a helpful Discord bot for AI Power Grid discussions.
+
+Current time: {timestamp}
 
 Recent conversation:
 {conversation_history}
@@ -284,13 +289,16 @@ Latest message from {author_name}: "{content}"
 Context from AI Power Grid documentation:
 {chr(10).join([f"[{i+1}] {item['text']}" for i, item in enumerate(context)])}
 
-If you should respond, return a JSON object like:
-{{"respond": true, "message": "your natural response here"}}
+Only respond if someone is asking for help or talking to you already.
+Be conversational but selective. Don't respond to every casual remark, but feel free to engage in ongoing discussions when it makes sense.
+You are fun but informative, and you are a discord entity for the AI Power Grid community. You have a wealth of knoweldge you can draw upon to answer questions and provide support.
+If you decide that you should respond, return a JSON object like:
+{{"respond": true, "message": "your response here"}}
 
 If you should NOT respond, return:
 {{"respond": false}}
 
-Only return valid JSON. Respond naturally and conversationally if you do respond.
+Only return valid JSON. And only respond if you deem it necessary, no need to be overly chatty.
 """
         
         # Get response from Grid API (no typing indicator during decision)
