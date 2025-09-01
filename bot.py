@@ -10,12 +10,27 @@ from grid_client import GridClient
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 DISCORD_CHANNELS = os.getenv('DISCORD_CHANNELS', '').split(',')
-ALLOWED_CHANNEL_IDS = [int(channel_id.strip()) for channel_id in DISCORD_CHANNELS if channel_id.strip()]
-LISTENING_CHANNEL_ID = int(os.getenv('LISTENING_CHANNEL_ID', '0'))  # Channel to listen for messages
+ALLOWED_CHANNEL_IDS = []
+for channel_id in DISCORD_CHANNELS:
+    if channel_id.strip():
+        try:
+            ALLOWED_CHANNEL_IDS.append(int(channel_id.strip()))
+        except ValueError:
+            print(f"Warning: Invalid channel ID '{channel_id}', skipping")
+
+LISTENING_CHANNEL_ID = 0
+try:
+    LISTENING_CHANNEL_ID = int(os.getenv('LISTENING_CHANNEL_ID', '0'))
+except ValueError:
+    print(f"Warning: Invalid LISTENING_CHANNEL_ID, using 0")
 BOT_NAME = os.getenv('BOT_NAME', 'ask-ai')  # Configurable bot name
 admin_id_str = os.getenv('ADMIN_USER_ID', '0')
 print(f"Admin ID from env: '{admin_id_str}'")
-ADMIN_USER_ID = int(admin_id_str)
+ADMIN_USER_ID = 0
+try:
+    ADMIN_USER_ID = int(admin_id_str)
+except ValueError:
+    print(f"Warning: Invalid ADMIN_USER_ID '{admin_id_str}', using 0")
 
 # Initialize the bot
 intents = discord.Intents.default()
