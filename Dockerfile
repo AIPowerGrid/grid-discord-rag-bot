@@ -26,5 +26,5 @@ RUN mkdir -p chroma_db
 # Expose port (if needed for health checks)
 EXPOSE 8000
 
-# Run the bot
-CMD ["python", "bot.py"]
+# Run the bot with unbuffered output
+CMD ["python", "-u", "bot.py"]
