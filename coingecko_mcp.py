@@ -15,7 +15,7 @@ import requests
 
 # CoinGecko MCP server URL
 COINGECKO_MCP_URL = "https://mcp.pro-api.coingecko.com/mcp"
-COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
 
 async def get_coingecko_session() -> Optional[ClientSession]:
     """Get a CoinGecko MCP session for testing purposes."""
