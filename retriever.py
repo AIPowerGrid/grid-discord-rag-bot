@@ -192,6 +192,131 @@ class DocumentRetriever:
         
         return f"Ingested document: {filename}"
     
+    def ingest_from_github_repo(self, repo_owner: str, repo_name: str, path: str = "", branch: str = "main", token: str = None) -> str:
+        """Ingest all .md files from a GitHub repository.
+        
+        Args:
+            repo_owner: GitHub username or organization name
+            repo_name: Repository name
+            path: Path within the repo to start from (default: root)
+            branch: Branch to pull from (default: "main")
+            token: Optional GitHub personal access token (for private repos or rate limits)
+        
+        Returns:
+            String summary of ingestion results
+        """
+        base_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
+        headers = {}
+        if token:
+            headers["Authorization"] = f"token {token}"
+        headers["Accept"] = "application/vnd.github.v3.raw"
+        
+        # Function to recursively find all .md files
+        def find_md_files(path_prefix: str = "") -> List[Dict[str, str]]:
+            """Recursively find all .md files in the repo."""
+            md_files = []
+            api_url = f"{base_url}/contents/{path_prefix}" if path_prefix else f"{base_url}/contents"
+            
+            if branch != "main":
+                api_url += f"?ref={branch}"
+            
+            try:
+                response = requests.get(api_url, headers={**headers, "Accept": "application/json"})
+                if response.status_code == 404:
+                    # Try with default branch parameter if not already included
+                    if branch == "main" and "?" not in api_url:
+                        api_url_with_branch = f"{api_url}?ref=main"
+                        response = requests.get(api_url_with_branch, headers={**headers, "Accept": "application/json"})
+                
+                response.raise_for_status()
+                contents = response.json()
+                
+                for item in contents:
+                    if item["type"] == "file" and item["name"].endswith((".md", ".mdx")):
+                        md_files.append({
+                            "path": item["path"],
+                            "download_url": item["download_url"],
+                            "name": item["name"]
+                        })
+                    elif item["type"] == "dir":
+                        # Recursively search subdirectories
+                        subdir_files = find_md_files(item["path"])
+                        md_files.extend(subdir_files)
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)
+                if hasattr(e, 'response') and e.response is not None:
+                    if e.response.status_code == 404:
+                        error_msg = f"Repository not found or is private. Status: 404. {'A GitHub token may be required for private repos.' if not token else 'Check repository name and permissions.'}"
+                    elif e.response.status_code == 403:
+                        error_msg = f"Access forbidden. Status: 403. Rate limit may be exceeded or token may be invalid."
+                print(f"Error accessing GitHub API for path {path_prefix}: {error_msg}")
+            
+            return md_files
+        
+        # Find all .md files
+        print(f"Searching for .md files in {repo_owner}/{repo_name}...")
+        md_files = find_md_files(path)
+        
+        if not md_files:
+            return f"No .md or .mdx files found in {repo_owner}/{repo_name}"
+        
+        print(f"Found {len(md_files)} markdown file(s), ingesting...")
+        
+        # Ingest each file
+        ingested_count = 0
+        errors = []
+        
+        for file_info in md_files:
+            try:
+                # Download file content
+                download_url = file_info["download_url"]
+                file_response = requests.get(download_url, headers={"Authorization": f"token {token}"} if token else {})
+                file_response.raise_for_status()
+                content = file_response.text
+                
+                # Create filename with path structure to avoid conflicts
+                # Use path as filename prefix to preserve directory structure
+                safe_path = file_info["path"].replace("/", "_").replace("\\", "_")
+                filename = f"github_{repo_owner}_{repo_name}_{safe_path}"
+                
+                # Save content to docs directory
+                doc_path = os.path.join('docs', filename)
+                with open(doc_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                
+                # Create document object
+                document = Document(
+                    text=content,
+                    metadata={
+                        "source": f"github:{repo_owner}/{repo_name}/{file_info['path']}",
+                        "github_path": file_info["path"],
+                        "repo": f"{repo_owner}/{repo_name}"
+                    }
+                )
+                
+                # Add to index
+                if self.index is None:
+                    self.index = VectorStoreIndex.from_documents(
+                        [document],
+                        storage_context=self.storage_context
+                    )
+                else:
+                    self.index.insert_nodes([document])
+                
+                ingested_count += 1
+                print(f"  ✓ Ingested: {file_info['path']}")
+                
+            except Exception as e:
+                error_msg = f"Error ingesting {file_info['path']}: {str(e)}"
+                errors.append(error_msg)
+                print(f"  ✗ {error_msg}")
+        
+        result = f"Ingested {ingested_count}/{len(md_files)} files from {repo_owner}/{repo_name}"
+        if errors:
+            result += f"\nErrors: {len(errors)} file(s) failed"
+        
+        return result
+    
     def get_relevant_context(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Retrieve relevant context for a query."""
         if self.index is None:

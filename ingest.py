@@ -21,6 +21,28 @@ def main():
         type=str,
         help="Path to a directory containing documents to ingest"
     )
+    parser.add_argument(
+        "--github", "-g",
+        type=str,
+        help="GitHub repository in format 'owner/repo' (e.g., 'user/repo')"
+    )
+    parser.add_argument(
+        "--github-path",
+        type=str,
+        default="",
+        help="Path within GitHub repo to start from (optional, default: root)"
+    )
+    parser.add_argument(
+        "--github-branch",
+        type=str,
+        default="main",
+        help="GitHub branch to pull from (default: main)"
+    )
+    parser.add_argument(
+        "--github-token",
+        type=str,
+        help="GitHub personal access token (optional, for private repos or higher rate limits)"
+    )
     
     args = parser.parse_args()
     
@@ -28,8 +50,8 @@ def main():
     retriever = DocumentRetriever()
     
     # Check if any arguments were provided
-    if not (args.file or args.url or args.dir):
-        print("No input specified. Please provide a file, URL, or directory.")
+    if not (args.file or args.url or args.dir or args.github):
+        print("No input specified. Please provide a file, URL, directory, or GitHub repo.")
         parser.print_help()
         return 1
     
@@ -87,6 +109,28 @@ def main():
                     print(f"Error ingesting {file_path}: {str(e)}")
         
         print(f"Ingested {count} files from {args.dir}")
+    
+    # Ingest from GitHub repo
+    if args.github:
+        print(f"Ingesting from GitHub repository: {args.github}")
+        try:
+            # Parse owner/repo from input
+            if "/" not in args.github:
+                print("Error: GitHub repo must be in format 'owner/repo'")
+                return 1
+            
+            owner, repo = args.github.split("/", 1)
+            result = retriever.ingest_from_github_repo(
+                repo_owner=owner,
+                repo_name=repo,
+                path=args.github_path,
+                branch=args.github_branch,
+                token=args.github_token
+            )
+            print(result)
+        except Exception as e:
+            print(f"Error ingesting from GitHub: {str(e)}")
+            return 1
     
     return 0
 

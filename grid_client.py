@@ -43,7 +43,7 @@ class GridClient:
             prompt = f"""
 You are a helpful assistant answering questions about AI Power Grid.
 Use only the following context and previous conversation to answer the question. 
-If you don't know the answer based on the context, say "I don't have enough information to answer this question."
+If you don't know the answer based on the context, respond naturally like "not sure about that" or "can't find info on that" - be casual, not formal.
 
 CONTEXT:
 {formatted_context}
@@ -56,7 +56,7 @@ ANSWER:
         else:
             prompt = f"""
 You are a helpful assistant answering questions about AI Power Grid.
-Use only the following context to answer the question. If you don't know the answer based on the context, say "I don't have enough information to answer this question."
+Use only the following context to answer the question. If you don't know the answer based on the context, respond naturally like "not sure about that" or "can't find info on that" - be casual, not formal.
 
 CONTEXT:
 {formatted_context}

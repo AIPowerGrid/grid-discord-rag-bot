@@ -61,6 +61,11 @@ A Discord bot that can answer questions about AI Power Grid using local document
 - `LISTENING_CHANNEL_ID`: Channel ID where the bot will actively listen and respond to messages (optional)
 - `ADMIN_USER_ID`: Discord user ID of the admin authorized to manage documents
 - `CHROMA_DB_PATH`: Path to store ChromaDB data (default: ./chroma_db)
+- `BOT_NAME`: Name of the bot (default: ask-ai)
+- `GITHUB_REPO`: GitHub repository to auto-ingest on startup (format: owner/repo, e.g., `AIPowerGrid/docs`)
+- `GITHUB_REPO_PATH`: Optional path within the GitHub repo to start from (default: root)
+- `GITHUB_REPO_BRANCH`: Branch to pull from (default: main)
+- `GITHUB_TOKEN`: Optional GitHub personal access token (for private repos or higher rate limits)
 
 ## Usage
 
