@@ -8,4 +8,8 @@ llama-index-embeddings-huggingface>=0.1.0
 sentence-transformers
 mcp
 httpx-sse
-matplotlib 
+matplotlib
+aiohttp
+Pillow
+openai
+anthropic 

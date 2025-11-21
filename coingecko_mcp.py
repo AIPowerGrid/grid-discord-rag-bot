@@ -130,117 +130,9 @@ async def _get_price_via_api(coin_id: str) -> Optional[str]:
 
 async def get_crypto_price(coin_id: str) -> Optional[str]:
     """Get current price for a cryptocurrency. Returns formatted string.
-    Tries MCP first, falls back to REST API if MCP fails."""
-    try:
-        # Try MCP first - use public server and try different tool names
-        # CoinGecko MCP tools might be named differently than expected
-        tool_names = ["get_coins_markets", "get_simple_price", "get_price", "get_price_data", "simple_price", "simplePrice"]
-        
-        for tool_name in tool_names:
-            try:
-                # Different tools might need different arguments
-                if tool_name == "get_coins_markets":
-                    # get_coins_markets uses different parameters
-                    tool_args = {"vs_currency": "usd", "ids": coin_id, "per_page": 1}
-                else:
-                    # Standard simple price arguments
-                    tool_args = {"ids": coin_id, "vs_currencies": "usd"}
-                
-                result = await _call_coingecko_tool(tool_name, tool_args)
-                if not result:
-                    continue
-                
-                # Parse the result
-                if result.content and len(result.content) > 0:
-                    content = result.content[0]
-                    if hasattr(content, 'text'):
-                        # Try to parse as JSON
-                        try:
-                            data = json.loads(content.text)
-                            
-                            # Handle get_coins_markets format (array of objects)
-                            if isinstance(data, list) and len(data) > 0:
-                                coin_data = data[0]
-                                if isinstance(coin_data, dict):
-                                    price = coin_data.get("current_price", 0)
-                                    change_24h = coin_data.get("price_change_percentage_24h", 0)
-                                    change_str = f" ({change_24h:+.2f}%)" if change_24h else ""
-                                    # Format price with appropriate decimals - more for small prices
-                                    if price < 0.01:
-                                        price_str = f"${price:.6f}".rstrip('0').rstrip('.')
-                                    elif price < 1:
-                                        price_str = f"${price:.4f}".rstrip('0').rstrip('.')
-                                    else:
-                                        price_str = f"${price:,.2f}"
-                                    return f"{coin_id}: {price_str}{change_str}"
-                            
-                            # Handle simple price format (dict with coin_id as key)
-                            if isinstance(data, dict) and coin_id in data:
-                                price_info = data[coin_id]
-                                if isinstance(price_info, dict) and "usd" in price_info:
-                                    price = price_info["usd"]
-                                    change_24h = price_info.get("usd_24h_change", 0)
-                                    change_str = f" ({change_24h:+.2f}%)" if change_24h else ""
-                                    # Format price with appropriate decimals - more for small prices
-                                    if price < 0.01:
-                                        price_str = f"${price:.6f}".rstrip('0').rstrip('.')
-                                    elif price < 1:
-                                        price_str = f"${price:.4f}".rstrip('0').rstrip('.')
-                                    else:
-                                        price_str = f"${price:,.2f}"
-                                    return f"{coin_id}: {price_str}{change_str}"
-                        except:
-                            return content.text
-                
-                # Try structured content
-                if hasattr(result, 'structuredContent') and result.structuredContent:
-                    data = result.structuredContent
-                    
-                    # Handle get_coins_markets format (array of objects)
-                    if isinstance(data, list) and len(data) > 0:
-                        coin_data = data[0]
-                        if isinstance(coin_data, dict):
-                            price = coin_data.get("current_price", 0)
-                            change_24h = coin_data.get("price_change_percentage_24h", 0)
-                            change_str = f" ({change_24h:+.2f}%)" if change_24h else ""
-                            # Format price with appropriate decimals - more for small prices
-                            if price < 0.01:
-                                price_str = f"${price:.6f}".rstrip('0').rstrip('.')
-                            elif price < 1:
-                                price_str = f"${price:.4f}".rstrip('0').rstrip('.')
-                            else:
-                                price_str = f"${price:,.2f}"
-                            return f"{coin_id}: {price_str}{change_str}"
-                    
-                    # Handle simple price format (dict with coin_id as key)
-                    if isinstance(data, dict):
-                        if coin_id in data:
-                            price_info = data[coin_id]
-                            if isinstance(price_info, dict) and "usd" in price_info:
-                                price = price_info["usd"]
-                                change_24h = price_info.get("usd_24h_change", 0)
-                                change_str = f" ({change_24h:+.2f}%)" if change_24h else ""
-                                # Format price with appropriate decimals - more for small prices
-                                if price < 0.01:
-                                    price_str = f"${price:.6f}".rstrip('0').rstrip('.')
-                                elif price < 1:
-                                    price_str = f"${price:.4f}".rstrip('0').rstrip('.')
-                                else:
-                                    price_str = f"${price:,.2f}"
-                                return f"{coin_id}: {price_str}{change_str}"
-                        return str(data)
-                
-            except Exception as tool_error:
-                # Try next tool name
-                continue
-        
-        # MCP failed, try REST API fallback
-        print(f"MCP failed for {coin_id}, trying REST API fallback...")
-        return await _get_price_via_api(coin_id)
-        
-    except Exception as e:
-        print(f"Error fetching crypto price: {e}, trying REST API fallback...")
-        return await _get_price_via_api(coin_id)
+    Uses REST API directly for accurate, up-to-date prices (MCP can be stale)."""
+    # Use REST API directly - MCP data can be stale
+    return await _get_price_via_api(coin_id)
 
 
 async def search_crypto(query: str) -> Optional[List[Dict[str, Any]]]:
@@ -725,38 +617,8 @@ async def get_crypto_context(message: str) -> str:
             crypto_data.append(price_data)
     
     if crypto_data:
-        # Format the crypto data more clearly for the LLM - make it very explicit
-        result = f"\n\n=== REAL-TIME CRYPTOCURRENCY PRICE DATA ===\n"
-        result += "\n".join(crypto_data)
-        result += "\n\nUse this EXACT price data when answering price questions."
-        
-        # Add CoinGecko links
-        coingecko_links = []
-        if "aipg" in message_lower or "ai power grid" in message_lower:
-            coingecko_links.append("AIPG CoinGecko page: https://www.coingecko.com/en/coins/ai-power-grid")
-        if "bitcoin" in message_lower or "btc" in message_lower:
-            coingecko_links.append("Bitcoin CoinGecko page: https://www.coingecko.com/en/coins/bitcoin")
-        if "ethereum" in message_lower or "eth" in message_lower:
-            coingecko_links.append("Ethereum CoinGecko page: https://www.coingecko.com/en/coins/ethereum")
-        
-        if coingecko_links:
-            result += "\n\n" + "\n".join(coingecko_links)
-            
-            # Add chart links
-            chart_links = []
-            if "aipg" in message_lower or "ai power grid" in message_lower:
-                chart_links.append("AIPG Chart (7d): https://www.coingecko.com/en/coins/ai-power-grid#chart")
-                chart_links.append("AIPG Chart (30d): https://www.coingecko.com/en/coins/ai-power-grid?view=chart&days=30")
-            if "bitcoin" in message_lower or "btc" in message_lower:
-                chart_links.append("Bitcoin Chart: https://www.coingecko.com/en/coins/bitcoin?view=chart")
-            if "ethereum" in message_lower or "eth" in message_lower:
-                chart_links.append("Ethereum Chart: https://www.coingecko.com/en/coins/ethereum?view=chart")
-            
-            if chart_links:
-                result += "\n\n" + "\n".join(chart_links)
-            
-            result += "\nIMPORTANT: When providing price information, ALWAYS link to the CoinGecko page above. Only mention Uniswap when someone asks about BUYING or TRADING."
-        
+        # Just provide raw price data, no formatting instructions
+        result = "\n".join(crypto_data)
         return result
     
     return ""

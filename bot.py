@@ -5,7 +5,11 @@ from io import BytesIO
 from dotenv import load_dotenv
 from retriever import DocumentRetriever
 from grid_client import GridClient
-from coingecko_mcp import get_crypto_context, generate_chart_image
+from coingecko_mcp import get_crypto_context
+from conversation_db import (
+    init_db, add_message, format_channel_history,
+    format_mood, format_memories, format_recent_happenings
+)
 
 # Load environment variables
 load_dotenv()
@@ -33,16 +37,12 @@ try:
 except ValueError:
     print(f"Warning: Invalid ADMIN_USER_ID '{admin_id_str}', using 0")
 
-# GitHub repo configuration for auto-ingestion
-GITHUB_REPO = os.getenv('GITHUB_REPO', '')  # Format: owner/repo
-GITHUB_REPO_PATH = os.getenv('GITHUB_REPO_PATH', '')  # Optional path within repo
-GITHUB_REPO_BRANCH = os.getenv('GITHUB_REPO_BRANCH', 'main')  # Branch to pull from
-GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')  # Optional token for private repos
-
 # Initialize the bot
 intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True  # Make sure we have message intents
+intents.reactions = True  # Need reactions for voting
+intents.members = True  # Need members intent for banning
 client = discord.Client(intents=intents)
 
 # Initialize document retriever and Grid client
@@ -51,40 +51,32 @@ grid_client = GridClient()
 
 # Store conversation history
 channel_message_history = {}
-MAX_MESSAGE_HISTORY = 25  # Number of messages to remember per channel
+MAX_MESSAGE_HISTORY = 10  # Number of messages to remember per channel
+
+# Scam detection and voting
+BAN_VOTE_THRESHOLD = 3  # Number of upvotes needed to ban
+DISMISS_VOTE_THRESHOLD = 3  # Number of downvotes needed to dismiss
+pending_ban_votes = {}  # {message_id: {'target_user_id': int, 'reason': str, 'upvotes': set, 'downvotes': set}}
 
 # Command prefixes
 COMMANDS = {
     'help': '!help',
     'upload': '!upload',
     'list': '!list',
-    'delete': '!delete',
-    'sync-github': '!sync-github'
+    'delete': '!delete'
 }
 
 @client.event
 async def on_ready():
     """Event called when the bot is ready."""
+    # Initialize database
+    init_db()
+    
     print(f'Logged in as {client.user} (ID: {client.user.id})')
     print(f'Bot name: {BOT_NAME}')
     print(f'Listening in ALL channels for automatic responses')
     print(f'Admin commands allowed in channels: {ALLOWED_CHANNEL_IDS}')
     print(f'Admin user ID: {ADMIN_USER_ID}')
-    
-    # Auto-ingest from GitHub repo if configured
-    if GITHUB_REPO:
-        if "/" not in GITHUB_REPO:
-            print(f'Warning: Invalid GITHUB_REPO format "{GITHUB_REPO}". Expected format: owner/repo')
-        else:
-            owner, repo = GITHUB_REPO.split("/", 1)
-            print(f'🔄 Auto-ingesting from GitHub repo: {owner}/{repo} (path: {GITHUB_REPO_PATH or "root"}, branch: {GITHUB_REPO_BRANCH})')
-            try:
-                # Run ingestion in background task (don't await - let it run in background)
-                import asyncio
-                asyncio.create_task(ingest_github_on_startup(owner, repo))
-            except Exception as e:
-                print(f'Error starting GitHub ingestion: {str(e)}')
-    
     print('------')
 
 def get_channel_history(channel_id):
@@ -93,37 +85,220 @@ def get_channel_history(channel_id):
         channel_message_history[channel_id] = []
     return channel_message_history[channel_id]
 
-def add_to_channel_history(channel_id, author_name, content, is_bot=False):
-    """Add a message to the channel's history."""
-    history = get_channel_history(channel_id)
-    history.append({
-        'author': author_name,
-        'content': content,
-        'is_bot': is_bot,
-        'timestamp': datetime.datetime.now()
-    })
-    # Keep only the most recent messages
-    channel_message_history[channel_id] = history[-MAX_MESSAGE_HISTORY:]
+# add_to_channel_history is now handled by add_message from conversation_db
 
-def format_channel_history(channel_id, max_messages=25):
-    """Format the channel history for context."""
-    history = get_channel_history(channel_id)
-    if not history:
-        return ""
+# format_channel_history is now imported from conversation_db
+
+def extract_urls_from_message(message_content: str) -> list[str]:
+    """Extract all URLs from a message."""
+    import re
+    url_patterns = [
+        r'https?://[^\s\)]+',  # Match URLs, stop at whitespace or closing paren
+        r'www\.[^\s\)]+',
+    ]
     
-    # Get the most recent messages
-    recent_messages = history[-max_messages:]
+    urls = []
+    for pattern in url_patterns:
+        matches = re.findall(pattern, message_content)
+        urls.extend(matches)
     
-    formatted_history = "Recent chat (last messages):\n"
-    for msg in recent_messages:
-        author = msg['author']
-        content = msg['content']
-        formatted_history += f"{author}: {content}\n"
+    return urls
+
+def is_forbidden_link_type(url: str, message_content: str) -> tuple[bool, str]:
+    """Check if a URL is a forbidden type (DEX, DeFi, support, Discord invite).
+    Returns (is_forbidden, reason)"""
+    import re
+    url_lower = url.lower()
+    content_lower = message_content.lower()
     
-    return formatted_history
+    # Discord invites (always forbidden)
+    discord_patterns = [
+        r'discord\.gg/',
+        r'discord\.com/invite/',
+        r'discordapp\.com/invite/',
+    ]
+    for pattern in discord_patterns:
+        if re.search(pattern, url_lower):
+            return True, "posted a Discord invite link"
+    
+    # Support ticket/help desk links
+    support_keywords = ['support', 'help', 'ticket', 'helpdesk', 'zendesk', 'freshdesk']
+    support_domains = ['support', 'help', 'ticket', 'helpdesk']
+    if any(keyword in url_lower for keyword in support_keywords) or any(domain in url_lower for domain in support_domains):
+        return True, "posted a support ticket/help link"
+    
+    # DEX (Decentralized Exchange) links
+    dex_keywords = ['dex', 'uniswap', 'pancakeswap', 'sushiswap', '1inch', 'dydx', 'curve', 'balancer', 'kyberswap']
+    dex_domains = ['uniswap', 'pancakeswap', 'sushiswap', '1inch', 'dydx', 'curve.fi', 'balancer', 'kyberswap']
+    if any(keyword in url_lower for keyword in dex_keywords) or any(domain in url_lower for domain in dex_domains):
+        return True, "posted a DEX (decentralized exchange) link"
+    
+    # DeFi platform links
+    defi_keywords = ['defi', 'lending', 'borrowing', 'yield', 'farm', 'staking', 'liquidity', 'pool']
+    defi_domains = ['aave', 'compound', 'makerdao', 'yearn', 'convex', 'frax']
+    if any(keyword in url_lower for keyword in defi_keywords) or any(domain in url_lower for domain in defi_domains):
+        # But allow if it's clearly about AIPG staking/pools (legitimate)
+        if 'aipg' in content_lower or 'aipowergrid' in content_lower or 'power grid' in content_lower:
+            return False, ""
+        return True, "posted a DeFi platform link"
+    
+    return False, ""
+
+def detect_discord_invite(message_content: str) -> tuple[bool, str]:
+    """Quick check for Discord invites (always flag these)."""
+    import re
+    content_lower = message_content.lower()
+    
+    discord_invite_patterns = [
+        r'discord\.gg/\w+',
+        r'discord\.com/invite/\w+',
+        r'discordapp\.com/invite/\w+',
+    ]
+    
+    for pattern in discord_invite_patterns:
+        if re.search(pattern, content_lower):
+            return True, "posted a Discord invite link"
+    
+    return False, ""
+
+async def analyze_link_with_ai(message_content: str, urls: list[str]) -> tuple[bool, str]:
+    """Use AI Power Grid to analyze if a message with links is a scam."""
+    import json
+    
+    urls_text = "\n".join([f"- {url}" for url in urls])
+    
+    analysis_prompt = f"""
+You are a security bot analyzing Discord messages for scams and phishing attempts.
+
+Analyze this message and determine if it's a scam:
+
+MESSAGE:
+"{message_content}"
+
+LINKS IN MESSAGE:
+{urls_text}
+
+Common scam patterns to look for:
+- Fake support tickets or help desk links
+- Fake airdrop or token claim links
+- Fake DEX (decentralized exchange) links
+- Fake wallet verification or migration links
+- Phishing sites trying to steal credentials
+- Suspicious domains that don't match official services
+- Urgent language trying to get users to click quickly
+- Promises of free tokens, airdrops, or rewards
+
+Return ONLY a JSON object with this exact format:
+{{"is_scam": true/false, "reason": "brief explanation of why it's suspicious or safe"}}
+
+If it's a scam, be specific about what type (e.g., "fake support ticket link", "suspicious airdrop claim", "phishing site", etc.).
+If it's safe, reason should be something like "appears to be legitimate" or "no scam indicators detected".
+
+Only return the JSON object, nothing else.
+"""
+    
+    try:
+        result = await grid_client.get_answer(analysis_prompt, [])
+        print(f"AI Scam Analysis Response: '{result}'")
+        
+        # Try to extract JSON from response
+        result_clean = result.strip()
+        
+        # Remove markdown code blocks if present
+        if result_clean.startswith('```'):
+            result_clean = result_clean.split('```')[1]
+            if result_clean.startswith('json'):
+                result_clean = result_clean[4:]
+        
+        result_clean = result_clean.strip()
+        
+        # Parse JSON
+        analysis = json.loads(result_clean)
+        
+        is_scam = analysis.get('is_scam', False)
+        reason = analysis.get('reason', 'analyzed by AI')
+        
+        return is_scam, reason
+        
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse AI scam analysis JSON: {e}")
+        print(f"Raw response: '{result}'")
+        # If AI fails, default to flagging it (safer)
+        return True, "AI analysis failed - flagged for review"
+    except Exception as e:
+        print(f"Error in AI scam analysis: {e}")
+        # If AI fails, default to flagging it (safer)
+        return True, "AI analysis error - flagged for review"
+
+async def handle_scam_detection(message):
+    """Handle detected scam messages by creating a vote."""
+    # Don't check admins
+    if message.author.id == ADMIN_USER_ID:
+        print(f"⏭️  Skipping scam check for admin: {message.author.display_name}")
+        return False
+    
+    print(f"🔍 Checking message for scams: '{message.content[:100]}...' from {message.author.display_name}")
+    
+    # Check for URLs
+    urls = extract_urls_from_message(message.content)
+    print(f"🔗 Extracted {len(urls)} URL(s): {urls}")
+    
+    if not urls:
+        # No links, not a scam
+        print(f"⏭️  No URLs found in message, skipping scam check")
+        return False
+    
+    # Check each URL for forbidden types (DEX, DeFi, support, Discord invites)
+    is_scam = False
+    reason = ""
+    
+    for url in urls:
+        is_forbidden, forbidden_reason = is_forbidden_link_type(url, message.content)
+        if is_forbidden:
+            print(f"🚨 Forbidden link type detected: {forbidden_reason} - URL: {url}")
+            is_scam = True
+            reason = forbidden_reason
+            break
+    
+    if not is_scam:
+        # No forbidden links found, use AI to analyze for other scam patterns
+        print(f"🔍 No forbidden link types detected. Analyzing {len(urls)} link(s) with AI for other scam patterns...")
+        is_scam, reason = await analyze_link_with_ai(message.content, urls)
+        print(f"🤖 AI Analysis Result: is_scam={is_scam}, reason='{reason}'")
+    
+    if not is_scam:
+        return False
+    
+    # Create vote message
+    vote_message_text = f"🚨 **Ban {message.author.mention} ({message.author.display_name})?**\nReason: {reason}\n\nReact ✅ to ban, ❌ to dismiss"
+    
+    try:
+        vote_message = await message.channel.send(vote_message_text)
+        
+        # Bot automatically adds its own ban vote (1 vote from bot, chat needs 2 more)
+        await vote_message.add_reaction('✅')
+        await vote_message.add_reaction('❌')
+        
+        # Store vote info with bot's vote already counted
+        pending_ban_votes[vote_message.id] = {
+            'target_user_id': message.author.id,
+            'target_user_name': message.author.display_name,
+            'reason': reason,
+            'original_message_id': message.id,
+            'channel_id': message.channel.id,
+            'upvotes': {client.user.id},  # Bot's vote counts as 1
+            'downvotes': set()
+        }
+        
+        print(f"🚨 Scam detected! Created ban vote for {message.author.display_name}: {reason} (Bot voted ✅, chat needs 2 more)")
+        return True
+        
+    except Exception as e:
+        print(f"Error creating ban vote: {e}")
+        return False
 
 def should_respond_to_message(content, author_id):
-    """ALWAYS let the AI decide - minimal checks only."""
+    """Basic filters - don't respond to bots, commands, or empty messages."""
     # Don't respond to bot messages
     if author_id == client.user.id:
         return False
@@ -136,9 +311,54 @@ def should_respond_to_message(content, author_id):
     if not content.strip():
         return False
     
-    # Everything else - let the AI decide
-    print(f"Message passed basic checks, letting AI decide: '{content}'")
     return True
+
+def has_obvious_trigger(content: str, message) -> bool:
+    """Quick implicit filter - like human skimming. Returns True if message catches attention."""
+    content_lower = content.lower()
+    
+    # Always respond to direct mentions
+    if client.user.mentioned_in(message):
+        return True
+    
+    # Always respond to replies to bot
+    if message.reference and message.reference.message_id:
+        try:
+            # We'll check if it's a reply to us in the main flow, but flag it here
+            return True
+        except:
+            pass
+    
+    # Question patterns
+    if '?' in content:
+        return True
+    
+    # Bot name mentioned
+    if BOT_NAME.lower() in content_lower:
+        return True
+    
+    # Explicit help requests
+    help_words = ['help', 'how do', 'how to', 'what is', 'what\'s', 'explain', 'tell me about', 'can you', 'could you']
+    if any(word in content_lower for word in help_words):
+        return True
+    
+    # Explicit price queries
+    price_patterns = ['price of', 'price for', 'what\'s the price', 'how much is', 'price?', 'cost']
+    if any(pattern in content_lower for pattern in price_patterns):
+        return True
+    
+    # Reaction requests
+    react_patterns = ['react', 'emoji', 'thumbs up', 'thumbsup', 'checkmark', 'like this', 'react to', 'react with']
+    if any(pattern in content_lower for pattern in react_patterns):
+        return True
+    
+    # AIPG/Power Grid related keywords (might need help)
+    aipg_keywords = ['aipg', 'power grid', 'staking', 'bridge', 'migration', 'worker', 'token']
+    if any(keyword in content_lower for keyword in aipg_keywords):
+        return True
+    
+    # Otherwise, skip (like human ignoring most messages)
+    return False
 
 def format_file_size(size_bytes):
     """Format file size in a human-readable format."""
@@ -153,25 +373,6 @@ def format_timestamp(timestamp):
     """Format a Unix timestamp to a human-readable date."""
     dt = datetime.datetime.fromtimestamp(timestamp)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-async def ingest_github_on_startup(owner: str, repo: str):
-    """Ingest from GitHub repo on startup (runs in background)."""
-    import asyncio
-    try:
-        # Run ingestion in a thread pool to avoid blocking the event loop
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            retriever.ingest_from_github_repo,
-            owner,
-            repo,
-            GITHUB_REPO_PATH,
-            GITHUB_REPO_BRANCH,
-            GITHUB_TOKEN
-        )
-        print(f'✅ {result}')
-    except Exception as e:
-        print(f'❌ Error ingesting from GitHub on startup: {str(e)}')
 
 async def handle_help_command(message):
     """Handle the !help command."""
@@ -205,8 +406,7 @@ async def handle_help_command(message):
             name="Document Management (Admin Only)",
             value=f"`{COMMANDS['upload']}` - Upload a document (attach a file)\n"
                   f"`{COMMANDS['list']}` - List all documents\n"
-                  f"`{COMMANDS['delete']} [filename]` - Delete a document\n"
-                  f"`{COMMANDS['sync-github']} owner/repo [path] [branch]` - Sync .md files from GitHub repo",
+                  f"`{COMMANDS['delete']} [filename]` - Delete a document",
             inline=False
         )
     
@@ -309,66 +509,29 @@ async def handle_delete_command(message):
     except Exception as e:
         await message.channel.send(f"❌ Error deleting document: {str(e)}")
 
-async def handle_sync_github_command(message):
-    """Handle the !sync-github command."""
-    # Check if user is authorized
-    if message.author.id != ADMIN_USER_ID:
-        await message.channel.send("You don't have permission to sync from GitHub.")
-        return
-    
-    # Extract the repo from the command
-    # Format: !sync-github owner/repo [path] [branch]
-    command_parts = message.content.split()
-    if len(command_parts) < 2:
-        await message.channel.send(
-            f"Please specify a GitHub repository. Usage: `{COMMANDS['sync-github']} owner/repo [path] [branch]`\n"
-            f"Example: `{COMMANDS['sync-github']} AIPowerGrid/docs` or `{COMMANDS['sync-github']} user/repo docs/main master`"
-        )
-        return
-    
-    repo_str = command_parts[1]
-    if "/" not in repo_str:
-        await message.channel.send("❌ Invalid format. Use `owner/repo` (e.g., `AIPowerGrid/docs`)")
-        return
-    
-    owner, repo = repo_str.split("/", 1)
-    path = command_parts[2] if len(command_parts) > 2 else ""
-    branch = command_parts[3] if len(command_parts) > 3 else "main"
-    
-    # Use the global GitHub token
-    
-    # Send processing message
-    await message.channel.send(f"🔄 Syncing markdown files from `{owner}/{repo}`...")
-    
-    try:
-        result = retriever.ingest_from_github_repo(
-            repo_owner=owner,
-            repo_name=repo,
-            path=path,
-            branch=branch,
-            token=GITHUB_TOKEN
-        )
-        await message.channel.send(f"✅ {result}")
-    except Exception as e:
-        await message.channel.send(f"❌ Error syncing from GitHub: {str(e)}")
-
 async def classify_and_respond(message):
     """Classify if the bot should respond and generate a natural response."""
     content = message.content.strip()
     author_name = message.author.display_name
     
-    print(f"\n🔍 Processing message: '{content}' from {author_name}")
-    
-    # Add the message to channel history
-    add_to_channel_history(message.channel.id, author_name, content)
-    
     # Check basic conditions first
     if not should_respond_to_message(content, message.author.id):
         return False
     
+    # Add the message to channel history (always save, but don't always process)
+    add_message(message.channel.id, author_name, content, author_id=message.author.id, is_bot=False)
+    
+    # STAGE 1: Quick implicit filter (like human skimming)
+    if not has_obvious_trigger(content, message):
+        print(f"⏭️  Skipped (no obvious trigger): '{content[:50]}...'")
+        return False
+    
+    # STAGE 2: Full processing (only if we got here - message caught attention)
+    print(f"\n🔍 Processing message: '{content}' from {author_name}")
+    
     try:
         # Get conversation history for context
-        conversation_history = format_channel_history(message.channel.id, max_messages=25)
+        conversation_history = format_channel_history(message.channel.id, max_messages=10)
         
         # Retrieve relevant documents for the response
         context = retriever.get_relevant_context(content)
@@ -376,88 +539,89 @@ async def classify_and_respond(message):
         # Get crypto market data if relevant
         crypto_context = await get_crypto_context(content)
         
+        # Get mood, memories, and recent happenings
+        mood_info = format_mood()
+        memories_info = format_memories()
+        happenings_info = format_recent_happenings()
+        
+        # Get channel information
+        channel_name = message.channel.name if hasattr(message.channel, 'name') else f"Channel {message.channel.id}"
+        channel_topic = ""
+        if hasattr(message.channel, 'topic') and message.channel.topic:
+            channel_topic = message.channel.topic
+        elif hasattr(message.channel, 'description') and message.channel.description:
+            channel_topic = message.channel.description
+        
+        channel_info = f"Channel: #{channel_name}"
+        if channel_topic:
+            channel_info += f"\nChannel description: {channel_topic}"
+        
         # Single API call with JSON response
         current_time = datetime.datetime.now()
         timestamp = current_time.strftime("%B %d, %Y at %I:%M %p")
         
-        # Check if message is from admin
-        is_admin = message.author.id == ADMIN_USER_ID
-        admin_note = f"\nNote: The user '{author_name}' (ID: {message.author.id}) is the server admin." if is_admin else ""
-        
-        # Get channel name and topic for context
-        channel_name = message.channel.name if hasattr(message.channel, 'name') else "unknown"
-        channel_topic = message.channel.topic if hasattr(message.channel, 'topic') and message.channel.topic else ""
-        channel_info = f"Current channel: #{channel_name}"
-        if channel_topic:
-            channel_info += f"\nChannel description: {channel_topic}"
-        
-        # Get admin name for context (if available)
-        admin_name_context = ""
-        if is_admin:
-            admin_name_context = f"\nIMPORTANT: {author_name} is the server admin - pay extra attention to their messages and be more likely to respond or react."
-        
         single_prompt = f"""
-You're {BOT_NAME}, just hanging out in this Discord server reading messages as they come in.
+You are {BOT_NAME}, a helpful Discord bot for AI Power Grid discussions.
 
-{channel_info}
 Current time: {timestamp}
 
-You just saw this message from {author_name}: "{content}"
-{admin_name_context}
+{channel_info}
 
-Recent chat (last 25 messages):
+{mood_info}
+{memories_info}
+{happenings_info}
+
+Recent conversation:
 {conversation_history}
 
-Context you know about AI Power Grid:
+Latest message from {author_name}: "{content}"
+
+Context from AI Power Grid documentation:
 {chr(10).join([f"[{i+1}] {item['text']}" for i, item in enumerate(context)])}
 {crypto_context}
 
-Think like a human reading Discord:
-- Did someone mention you or ask you something? → Respond or react
-- Is the admin ({author_name if is_admin else "someone"}) saying something? → Pay extra attention, more likely to engage
-- Something funny/interesting/you agree with? → You can react with an emoji occasionally, but don't overdo it
-- A question that needs an answer? → Help if you know it
-- People talking to each other? → Only jump in if relevant, otherwise just react or stay quiet
+DEFAULT BEHAVIOR: Stay quiet unless you have something valuable to add. Most messages don't need a response - that's normal and expected. Think like a human: you naturally stay quiet most of the time.
 
-Your personality: Direct, snarky when appropriate, crypto-native, helpful but not a pushover. No fluff.
+Only respond when:
+- You're directly mentioned or asked a question
+- Someone needs help you can provide
+- You have relevant information that adds value
+- Someone asks you to react/acknowledge something
 
-CRITICAL INFORMATION ABOUT AIPG:
-- ⚠️ PROOF-OF-WORK MINING IS DEAD - The PoW chain is deprecated and no longer operational
-- ✅ STAKING ON BASE IS LIVE - Users should stake AIPG on Base network, not mine on PoW
-- Staking interface: https://aipowergrid.io/staking
-- Staking contract: 0x3ED14A6D5A48614D77f313389611410d38fd8277 on Base
-- When anyone mentions mining, PoW, or asks how to earn AIPG, DIRECTLY tell them:
-  "PoW mining is dead. Stake your AIPG on Base instead: https://aipowergrid.io/staking"
-- Do NOT provide price information unless someone EXPLICITLY asks about price (e.g., "what's the price", "how much is", "show me the price")
+DO NOT respond to:
+- Casual conversation between others
+- General statements that don't need acknowledgment
+- Messages where you don't have anything useful to add
+- Off-topic discussions unless directly asked
 
-When providing crypto price information (ONLY when explicitly asked):
-- You CAN look up ANY cryptocurrency by name or symbol using CoinGecko's search - try searching first before saying you don't know
-- If someone asks about a coin you don't recognize, search for it first before saying you don't know
-- Link to CoinGecko page: https://www.coingecko.com/en/coins/[coin-name] (use this for price info, charts, market data)
-- Only mention Uniswap when someone asks about BUYING or TRADING: https://app.uniswap.org/swap?outputCurrency=0xa1c0deCaFE3E9Bf06A5F29B7015CD373a9854608&chain=base
-- For price questions, always use CoinGecko link, not Uniswap
+You are fun but informative, and you are a discord entity for the AI Power Grid community. You have a wealth of knowledge you can draw upon to answer questions and provide support.
 
-Emoji reactions - use sparingly and only when appropriate:
-- 👍 = agree/correct/good point
-- 😂 = funny  
-- ❤️ = like/appreciate
-- ✅ = confirmed/works
-- 🤔 = thinking about it
-- 😮 = surprised/interesting
-- 🎉 = celebration/excitement
-- 🔥 = something is hot/good
-- 💀 = something is so funny/ridiculous it killed you
-- Use emojis occasionally, not constantly - keep it natural and not excessive
+IMPORTANT: Respond naturally in plain text. No templates, no structured formats, no embeds. Just talk like a normal person. If someone asks about crypto prices, just tell them naturally - don't use any special formatting or templates.
 
-Admin priority: If {author_name if is_admin else "the admin"} says something, you're more likely to respond or react. They're important.
+EMOJI REACTIONS: For short confirmations, affirmatives, or acknowledgments, prefer using emoji reactions instead of text messages. You can use any emoji that fits the situation - be creative! Common uses:
+- Confirmations/agreement: 👍 ✅ 👌
+- Disagreement/no: 👎 ❌
+- Appreciation: ❤️ 🙏
+- Excitement/celebration: 🎉 🔥 🚀
+- Or any other emoji that fits the context
 
-Return JSON only:
-- {{"respond": true, "message": "text here"}} - send a message
-- {{"respond": true, "react": "👍"}} - just react (use any emoji)
-- {{"respond": true, "message": "text", "react": "👍"}} - both
-- {{"respond": false}} - do nothing
+Only send a text message if you need to provide information, ask a question, or explain something. For simple confirmations/acknowledgments, just react with an emoji.
 
-Only valid JSON. No other text.
+If you decide that you should respond, return a JSON object like:
+{{"respond": true, "message": "your response here"}}
+
+For short confirmations/affirmatives, prefer just reacting (use any appropriate emoji):
+{{"respond": true, "react": "👍"}}
+
+Or combine both if you need to say something AND acknowledge:
+{{"respond": true, "message": "your response here", "react": "👍"}}
+
+You can use any Discord emoji - be creative and pick what fits best!
+
+If you should NOT respond (most cases), return:
+{{"respond": false}}
+
+Only return valid JSON. Default to staying quiet - only respond when you have value to add.
 """
         
         # Get response from Grid API (no typing indicator during decision)
@@ -480,115 +644,87 @@ Only valid JSON. No other text.
             
             if response_data.get("respond", False):
                 response_message = response_data.get("message", "")
-                emoji_reaction = response_data.get("react", "")
+                react_emoji = response_data.get("react", None)
                 
-                # Handle emoji reaction (if present)
-                if emoji_reaction:
+                # Handle reactions - check if we need to react to a previous message
+                if react_emoji:
+                    target_message = message  # Default to current message
+                    
+                    # Check if user wants to react to a previous message
+                    content_lower = content.lower()
+                    needs_previous = any(phrase in content_lower for phrase in [
+                        'few messages ago', 'previous message', 'earlier message', 
+                        'that message', 'my message', 'a few messages ago'
+                    ])
+                    
+                    if needs_previous:
+                        # Fetch recent messages to find the target
+                        try:
+                            messages_found = []
+                            async for msg in message.channel.history(limit=20):
+                                # Skip the current message and bot messages
+                                if msg.id == message.id or msg.author == client.user:
+                                    continue
+                                messages_found.append(msg)
+                            
+                            # If they said "my message", find their message
+                            if 'my message' in content_lower:
+                                user_messages = [msg for msg in messages_found if msg.author.id == message.author.id]
+                                
+                                # If they also said "few messages ago", skip forward a bit
+                                if 'few' in content_lower or 'several' in content_lower:
+                                    # Find their message that's a few back (skip first 1-2 of their messages)
+                                    skip_own = 1 if len(user_messages) > 1 else 0
+                                    if len(user_messages) > skip_own:
+                                        target_message = user_messages[skip_own]
+                                        print(f"Found user's message {skip_own+1} back: {target_message.id} - '{target_message.content[:50]}...'")
+                                    elif len(user_messages) > 0:
+                                        target_message = user_messages[0]
+                                        print(f"Found user's most recent message: {target_message.id} - '{target_message.content[:50]}...'")
+                                else:
+                                    # Just "my message" - find their most recent
+                                    if len(user_messages) > 0:
+                                        target_message = user_messages[0]
+                                        print(f"Found user's most recent message: {target_message.id} - '{target_message.content[:50]}...'")
+                            # Otherwise, find a message a few back (skip 1-3 messages)
+                            else:
+                                # Try to find message 2-4 messages back
+                                skip_count = 2  # Default: 2 messages back
+                                if 'few' in content_lower or 'several' in content_lower:
+                                    skip_count = 3
+                                
+                                if len(messages_found) > skip_count:
+                                    target_message = messages_found[skip_count]
+                                    print(f"Found message {skip_count} back: {target_message.id} - '{target_message.content[:50]}...'")
+                                elif len(messages_found) > 0:
+                                    # Fallback to first non-bot message found
+                                    target_message = messages_found[0]
+                                    print(f"Found first previous message: {target_message.id} - '{target_message.content[:50]}...'")
+                                    
+                        except Exception as e:
+                            print(f"Error fetching message history: {e}")
+                    
                     try:
-                        await message.add_reaction(emoji_reaction)
-                        print(f"Reacted with: {emoji_reaction}")
+                        await target_message.add_reaction(react_emoji)
+                        print(f"Reacted with {react_emoji} to message {target_message.id} from {target_message.author.display_name}")
                     except Exception as e:
                         print(f"Error adding reaction: {e}")
                 
-                # Handle text response (if present)
                 if response_message:
                     # Add bot response to channel history
-                    add_to_channel_history(message.channel.id, BOT_NAME, response_message, is_bot=True)
+                    add_message(message.channel.id, BOT_NAME, response_message, author_id=client.user.id, is_bot=True)
                     
-                    # Check if this is a price-related message and generate chart
-                    content_lower = content.lower()
-                    coin_id = None
-                    coin_name = None
-                    if "aipg" in content_lower or "ai power grid" in content_lower:
-                        coin_id = "ai-power-grid"
-                        coin_name = "AIPG"
-                    elif "bitcoin" in content_lower or "btc" in content_lower:
-                        coin_id = "bitcoin"
-                        coin_name = "Bitcoin"
-                    elif "ethereum" in content_lower or "eth" in content_lower:
-                        coin_id = "ethereum"
-                        coin_name = "Ethereum"
-                    
-                    # Check if message asks about price/chart
-                    is_price_query = any(word in content_lower for word in ["price", "chart", "graph", "how much", "what's the", "cost", "show me"])
-                    is_chart_request = any(word in content_lower for word in ["chart", "graph", "show me"])
-                    
-                    # Show typing indicator while generating chart
+                    # Show typing indicator for 1-2 seconds before responding
                     async with message.channel.typing():
                         import asyncio
-                        
-                        # Generate chart if it's a price query OR explicit chart request
-                        chart_file = None
-                        if coin_id and (is_price_query or is_chart_request):
-                            try:
-                                print(f"📊 Generating chart for {coin_name} (coin_id={coin_id})...")
-                                chart_buffer = await generate_chart_image(coin_id, coin_name, days=7, use_candlesticks=True)
-                                if chart_buffer:
-                                    chart_file = discord.File(chart_buffer, filename=f"{coin_id}_chart.png")
-                                    print(f"✅ Generated chart for {coin_name} ({len(chart_buffer.getvalue())} bytes)")
-                                else:
-                                    print(f"⚠️ Chart generation returned None for {coin_name}")
-                            except Exception as e:
-                                print(f"❌ Error generating chart: {e}")
-                                import traceback
-                                traceback.print_exc()
-                        else:
-                            if coin_id:
-                                print(f"⚠️ Chart not generated: coin_id={coin_id}, is_price_query={is_price_query}, is_chart_request={is_chart_request}")
-                        
-                        # Small delay before sending
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(1.5)  # 1.5 second delay
                     
-                    # Send the response with chart embed if available
-                    if chart_file:
-                        # Create embed with chart
-                        embed = discord.Embed(
-                            title=f"{coin_name} Price",
-                            description=response_message,
-                            color=0x8cc84b  # CoinGecko green
-                        )
-                        embed.set_image(url=f"attachment://{coin_id}_chart.png")
-                        embed.add_field(
-                            name="View on CoinGecko",
-                            value=f"https://www.coingecko.com/en/coins/{coin_id}",
-                            inline=False
-                        )
-                        await message.channel.send(embed=embed, file=chart_file)
-                        print(f"Sent response with chart embed")
-                    else:
-                        # Check if we should use DexScreener chart URL instead
-                        from coingecko_mcp import get_dexscreener_url
-                        
-                        # Use DexScreener for AIPG since it's DEX-focused
-                        if coin_id == "ai-power-grid":
-                            dex_url = get_dexscreener_url("0xa1c0deCaFE3E9Bf06A5F29B7015CD373a9854608", "base")
-                            # Create embed with DexScreener chart
-                            embed = discord.Embed(
-                                title=f"{coin_name} Price",
-                                description=response_message,
-                                color=0x6366f1  # DexScreener purple-ish
-                            )
-                            # DexScreener doesn't provide direct image URLs, but we can link to it
-                            embed.add_field(
-                                name="📊 Chart on DexScreener",
-                                value=f"[View Live Chart]({dex_url})",
-                                inline=False
-                            )
-                            embed.add_field(
-                                name="📈 CoinGecko",
-                                value=f"[Price & Market Data](https://www.coingecko.com/en/coins/{coin_id})",
-                                inline=False
-                            )
-                            await message.channel.send(embed=embed)
-                            print(f"Sent response with DexScreener chart link")
-                        else:
-                            # Send the response naturally
-                            await message.channel.send(response_message)
-                            print(f"Responding with: '{response_message}'")
+                    # Send the response naturally
+                    await message.channel.send(response_message)
+                    print(f"Responding with: '{response_message}'")
                     return True
-                elif emoji_reaction:
-                    # Only reaction, no message - that's fine
-                    print(f"Only reacted with emoji: {emoji_reaction}")
+                elif react_emoji:
+                    # Only reacted, no message
                     return True
                 else:
                     print("Response data has respond=true but no message or reaction")
@@ -607,11 +743,85 @@ Only valid JSON. No other text.
         return False
 
 @client.event
+async def on_reaction_add(reaction, user):
+    """Handle reactions on ban vote messages."""
+    # Ignore bot's own reactions
+    if user == client.user:
+        return
+    
+    # Check if this is a ban vote message
+    if reaction.message.id not in pending_ban_votes:
+        return
+    
+    vote_info = pending_ban_votes[reaction.message.id]
+    
+    # Ignore reactions from the target user
+    if user.id == vote_info['target_user_id']:
+        return
+    
+    # Handle upvote (✅)
+    if str(reaction.emoji) == '✅':
+        vote_info['upvotes'].add(user.id)
+        print(f"✅ Upvote added for ban vote. Total: {len(vote_info['upvotes'])}/{BAN_VOTE_THRESHOLD}")
+        
+        # Check if threshold met
+        if len(vote_info['upvotes']) >= BAN_VOTE_THRESHOLD:
+            await execute_ban(reaction.message, vote_info)
+    
+    # Handle downvote (❌)
+    elif str(reaction.emoji) == '❌':
+        vote_info['downvotes'].add(user.id)
+        print(f"❌ Downvote added for ban vote. Total: {len(vote_info['downvotes'])}/{DISMISS_VOTE_THRESHOLD}")
+        
+        # If downvotes reach threshold, dismiss
+        if len(vote_info['downvotes']) >= DISMISS_VOTE_THRESHOLD:
+            await reaction.message.edit(content=f"❌ Vote dismissed. {vote_info['target_user_name']} will not be banned.")
+            del pending_ban_votes[reaction.message.id]
+
+async def execute_ban(vote_message, vote_info):
+    """Execute the ban after threshold is met."""
+    try:
+        channel = vote_message.channel
+        target_user_id = vote_info['target_user_id']
+        target_user_name = vote_info['target_user_name']
+        reason = vote_info['reason']
+        
+        # Get the member object
+        member = channel.guild.get_member(target_user_id)
+        if not member:
+            await vote_message.edit(content=f"❌ User {target_user_name} not found in server.")
+            del pending_ban_votes[vote_message.id]
+            return
+        
+        # Ban the user
+        await member.ban(reason=f"Community vote: {reason}")
+        
+        # Update vote message
+        await vote_message.edit(content=f"✅ **{target_user_name} has been banned.**\nReason: {reason}\nVotes: {len(vote_info['upvotes'])} ✅")
+        
+        # Clean up
+        del pending_ban_votes[vote_message.id]
+        
+        print(f"✅ Banned {target_user_name} ({target_user_id}) - Reason: {reason}")
+        
+    except discord.Forbidden:
+        await vote_message.edit(content=f"❌ Missing permissions to ban {target_user_name}.")
+        del pending_ban_votes[vote_message.id]
+    except Exception as e:
+        await vote_message.edit(content=f"❌ Error banning user: {str(e)}")
+        del pending_ban_votes[vote_message.id]
+        print(f"Error executing ban: {e}")
+
+@client.event
 async def on_message(message):
     """Event called when a message is received."""
     # Ignore messages from the bot itself
     if message.author == client.user:
         return
+    
+    # Check for scam messages first
+    if await handle_scam_detection(message):
+        return  # Don't process further if scam detected
     
     # Handle document management commands in allowed channels
     if message.channel.id in ALLOWED_CHANNEL_IDS:
@@ -633,11 +843,6 @@ async def on_message(message):
         # Handle delete command
         if message.content.startswith(COMMANDS['delete']):
             await handle_delete_command(message)
-            return
-        
-        # Handle sync-github command
-        if message.content.startswith(COMMANDS['sync-github']):
-            await handle_sync_github_command(message)
             return
     
     # Handle direct file uploads (if user is admin and in allowed channel)
@@ -674,68 +879,14 @@ async def on_message(message):
                 # Send a typing indicator to show the bot is processing
                 async with message.channel.typing():
                     try:
-                        # Get conversation history
-                        conversation_history = format_channel_history(message.channel.id, max_messages=10)
-                        
                         # Retrieve relevant documents
                         context = retriever.get_relevant_context(question)
                         
-                        # Get crypto market data if relevant
-                        crypto_context = await get_crypto_context(question)
-                        
-                        # Build prompt for reply
-                        current_time = datetime.datetime.now()
-                        timestamp = current_time.strftime("%B %d, %Y at %I:%M %p")
-                        
-                        is_admin = message.author.id == ADMIN_USER_ID
-                        admin_note = f"\nNote: The user '{message.author.display_name}' (ID: {message.author.id}) is the server admin." if is_admin else ""
-                        
-                        # Get channel name for context
-                        channel_name = message.channel.name if hasattr(message.channel, 'name') else "unknown"
-                        
-                        prompt = f"""
-You are {BOT_NAME}, a member of this Discord server.
-
-Current channel: #{channel_name}
-Current time: {timestamp}
-{admin_note}
-
-Recent conversation:
-{conversation_history}
-
-User asked: "{question}"
-
-Context from AI Power Grid documentation:
-{chr(10).join([f"[{i+1}] {item['text']}" for i, item in enumerate(context)])}
-{crypto_context}
-
-CRITICAL INFORMATION ABOUT AIPG:
-- ⚠️ PROOF-OF-WORK MINING IS DEAD - The PoW chain is deprecated and no longer operational
-- ✅ STAKING ON BASE IS LIVE - Users should stake AIPG on Base network, not mine on PoW
-- Staking interface: https://aipowergrid.io/staking
-- When anyone mentions mining, PoW, or asks how to earn AIPG, DIRECTLY tell them:
-  "PoW mining is dead. Stake your AIPG on Base instead: https://aipowergrid.io/staking"
-- Do NOT provide price information unless someone EXPLICITLY asks about price
-
-Answer naturally and conversationally. If you don't know something, say it casually like "not sure about that" or "don't have info on that" - never say "I don't have enough information to answer this question" or any formal corporate-speak.
-Be brief and helpful. No embeds, just natural text response.
-
-When providing crypto price information (ONLY when explicitly asked):
-- You CAN look up ANY cryptocurrency by name or symbol using CoinGecko's search - try searching first before saying you don't know
-- If someone asks about a coin you don't recognize, search for it first before saying you don't know
-- Link to CoinGecko page: https://www.coingecko.com/en/coins/[coin-name] (use this for price info, charts, market data)
-- Only mention Uniswap when someone asks about BUYING or TRADING: https://app.uniswap.org/swap?outputCurrency=0xa1c0deCaFE3E9Bf06A5F29B7015CD373a9854608&chain=base
-- For price questions, always use CoinGecko link, not Uniswap
-"""
-                        
                         # Send to Grid API for answer
-                        answer = await grid_client.get_answer(prompt, [])
+                        answer = await grid_client.get_answer(question, context)
                         
-                        # Send natural response (no embed)
+                        # Send natural text response (no embeds)
                         await message.channel.send(answer)
-                        
-                        # Add bot response to history
-                        add_to_channel_history(message.channel.id, BOT_NAME, answer, is_bot=True)
                     except Exception as e:
                         await message.channel.send(f"Error: {str(e)}")
                 
@@ -756,78 +907,17 @@ When providing crypto price information (ONLY when explicitly asked):
             await handle_help_command(message)
             return
         
-        # Add to channel history
-        add_to_channel_history(message.channel.id, message.author.display_name, content)
-        
         # Send a typing indicator to show the bot is processing
         async with message.channel.typing():
             try:
-                # Get conversation history
-                conversation_history = format_channel_history(message.channel.id, max_messages=10)
-                
                 # Retrieve relevant documents
                 context = retriever.get_relevant_context(question)
                 
-                # Get crypto market data if relevant
-                crypto_context = await get_crypto_context(question)
-                
-                # Build prompt similar to classify_and_respond but for direct mentions
-                current_time = datetime.datetime.now()
-                timestamp = current_time.strftime("%B %d, %Y at %I:%M %p")
-                
-                is_admin = message.author.id == ADMIN_USER_ID
-                admin_note = f"\nNote: The user '{message.author.display_name}' (ID: {message.author.id}) is the server admin." if is_admin else ""
-                
-                # Get channel name and topic for context
-                channel_name = message.channel.name if hasattr(message.channel, 'name') else "unknown"
-                channel_topic = message.channel.topic if hasattr(message.channel, 'topic') and message.channel.topic else ""
-                channel_info = f"Current channel: #{channel_name}"
-                if channel_topic:
-                    channel_info += f"\nChannel description: {channel_topic}"
-                
-                prompt = f"""
-You are {BOT_NAME}, a member of this Discord server.
-
-{channel_info}
-Current time: {timestamp}
-{admin_note}
-
-Recent conversation:
-{conversation_history}
-
-User asked: "{question}"
-
-Context from AI Power Grid documentation:
-{chr(10).join([f"[{i+1}] {item['text']}" for i, item in enumerate(context)])}
-{crypto_context}
-
-CRITICAL INFORMATION ABOUT AIPG:
-- ⚠️ PROOF-OF-WORK MINING IS DEAD - The PoW chain is deprecated and no longer operational
-- ✅ STAKING ON BASE IS LIVE - Users should stake AIPG on Base network, not mine on PoW
-- Staking interface: https://aipowergrid.io/staking
-- When anyone mentions mining, PoW, or asks how to earn AIPG, DIRECTLY tell them:
-  "PoW mining is dead. Stake your AIPG on Base instead: https://aipowergrid.io/staking"
-- Do NOT provide price information unless someone EXPLICITLY asks about price
-
-Answer naturally and conversationally. If you don't know something, say it casually like "not sure about that" or "don't have info on that" - never say "I don't have enough information to answer this question" or any formal corporate-speak.
-Be brief and helpful. No embeds, just natural text response.
-
-When providing crypto price information (ONLY when explicitly asked):
-- You CAN look up ANY cryptocurrency by name or symbol using CoinGecko's search - try searching first before saying you don't know
-- If someone asks about a coin you don't recognize, search for it first before saying you don't know
-- Link to CoinGecko page: https://www.coingecko.com/en/coins/[coin-name] (use this for price info, charts, market data)
-- Only mention Uniswap when someone asks about BUYING or TRADING: https://app.uniswap.org/swap?outputCurrency=0xa1c0deCaFE3E9Bf06A5F29B7015CD373a9854608&chain=base
-- For price questions, always use CoinGecko link, not Uniswap
-"""
-                
                 # Send to Grid API for answer
-                answer = await grid_client.get_answer(prompt, [])
+                answer = await grid_client.get_answer(question, context)
                 
-                # Send natural response (no embed)
+                # Send natural text response (no embeds)
                 await message.channel.send(answer)
-                
-                # Add bot response to history
-                add_to_channel_history(message.channel.id, BOT_NAME, answer, is_bot=True)
             except Exception as e:
                 await message.channel.send(f"Error: {str(e)}")
 
